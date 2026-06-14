@@ -26,11 +26,14 @@ Resume assistant uses Anthropic Agent Skills (docx, pdf) with the Files API:
 import io
 import os
 import json
+import time
 import base64
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator, List, Optional
 
 import anthropic
+import services.cosmos_service as db_svc
 
 logger = logging.getLogger(__name__)
 
@@ -88,17 +91,17 @@ RESUME_SYSTEM = (
 
 # ── Client factory ────────────────────────────────────────────────────────────
 def _get_async_client() -> anthropic.AsyncAnthropic:
-    kwargs: dict = {"api_key": API_KEY}
-    if BASE_URL:
-        kwargs["base_url"] = BASE_URL
-    return anthropic.AsyncAnthropic(**kwargs)
+    return anthropic.AsyncAnthropic(
+        base_url=BASE_URL,
+        api_key=API_KEY,
+    )
 
 
 def _get_sync_client() -> anthropic.Anthropic:
-    kwargs: dict = {"api_key": API_KEY}
-    if BASE_URL:
-        kwargs["base_url"] = BASE_URL
-    return anthropic.Anthropic(**kwargs)
+    return anthropic.Anthropic(
+        base_url=BASE_URL,
+        api_key=API_KEY,
+    )
 
 
 # ── Content helpers ───────────────────────────────────────────────────────────
@@ -281,12 +284,38 @@ async def stream_chat(
       message_stop    – final: full_text, usage, tools_used, model
     """
     client = _get_async_client()
+    conversation_id: str = conversation["id"]
     agent_type = conversation.get("agentType", "claude")
     settings = conversation.get("settings", {})
     system_prompt = RESUME_SYSTEM if agent_type == "resume_assistant" else CLAUDE_SYSTEM
     effective_model = model if model else MODEL_ID
 
     use_skills = agent_type == "resume_assistant" and output_format in ("docx", "pdf")
+
+    # ── Container reuse for skills ────────────────────────────────────────────
+    # Containers expire after 30 days. Reuse the stored ID when still valid;
+    # a new one will be created (and its ID saved) if absent or expired.
+    existing_container_id: Optional[str] = None
+    if use_skills:
+        stored_id = conversation.get("skillContainerId")
+        stored_at = conversation.get("skillContainerCreatedAt")
+        if stored_id and stored_at:
+            try:
+                created = datetime.fromisoformat(stored_at)
+                if (datetime.now(timezone.utc) - created) < timedelta(days=30):
+                    existing_container_id = stored_id
+            except Exception:
+                pass  # malformed timestamp — will create a fresh container
+
+    # ── Persist user message (item 1 of 2) ───────────────────────────────────
+    start_ts = time.monotonic()
+    user_msg = await db_svc.save_message(
+        conversation_id=conversation_id,
+        role="user",
+        content=new_message,
+        attachments=attachments,
+        model=model,
+    )
 
     # Rebuild message history from stored records
     api_messages: list = [
@@ -368,15 +397,19 @@ async def stream_chat(
                     ),
                 },
                 "extra_body": {
-                    "container": {
-                        "skills": [
-                            {
-                                "type": "anthropic",
-                                "skill_id": output_format,  # "docx" or "pdf"
-                                "version": "latest",
-                            }
-                        ],
-                    },
+                    "container": (
+                        {"id": existing_container_id}
+                        if existing_container_id
+                        else {
+                            "skills": [
+                                {
+                                    "type": "anthropic",
+                                    "skill_id": output_format,  # "docx" or "pdf"
+                                    "version": "latest",
+                                }
+                            ],
+                        }
+                    ),
                 },
             }
         else:
@@ -444,6 +477,25 @@ async def stream_chat(
         if use_skills and generated_file_id is None:
             generated_file_id = _extract_skill_file_id(final.content)
 
+        # Persist container ID from first reply so subsequent turns reuse it
+        if use_skills and existing_container_id is None:
+            raw = getattr(final, "container", None)
+            if raw is None:
+                raw = (final.model_extra or {}).get("container")
+            if raw is not None:
+                cid = (
+                    raw.get("id") if isinstance(raw, dict) else getattr(raw, "id", None)
+                )
+                if cid:
+                    await db_svc.update_conversation(
+                        conversation_id,
+                        {
+                            "skillContainerId": cid,
+                            "skillContainerCreatedAt": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    existing_container_id = cid  # skip on pause_turn re-entries
+
         stop_reason = final.stop_reason
 
         if stop_reason == "pause_turn":
@@ -458,13 +510,27 @@ async def stream_chat(
         break
 
     total_usage["total"] = total_usage["input"] + total_usage["output"]
+    latency_ms = int((time.monotonic() - start_ts) * 1000)
+
+    # ── Persist AI reply (item 2 of 2) ───────────────────────────────────────
+    asst_msg = None
+    if full_response_text:
+        asst_msg = await db_svc.save_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=full_response_text,
+            model=effective_model,
+            tokens=total_usage,
+            latency_ms=latency_ms,
+            tools_used=list(dict.fromkeys(tools_used)) or None,
+        )
 
     # Emit file_generated before message_stop so the client can attach the
     # download button to the correct message before the stream closes
     if generated_file_id:
         yield f"data: {json.dumps({'type': 'file_generated', 'file_id': generated_file_id, 'format': output_format})}\n\n"
 
-    yield f"data: {json.dumps({'type': 'message_stop', 'full_text': full_response_text, 'usage': total_usage, 'tools_used': list(dict.fromkeys(tools_used)), 'model': effective_model})}\n\n"
+    yield f"data: {json.dumps({'type': 'message_stop', 'full_text': full_response_text, 'usage': total_usage, 'tools_used': list(dict.fromkeys(tools_used)), 'model': effective_model, 'user_message_id': user_msg['id'], 'assistant_message_id': asst_msg['id'] if asst_msg else None, 'latency_ms': latency_ms})}\n\n"
 
 
 # ── Title generation ──────────────────────────────────────────────────────────

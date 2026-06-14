@@ -1,5 +1,4 @@
 import json
-import time
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse, FileResponse, Response
@@ -23,24 +22,15 @@ async def stream_chat(body: StreamChatRequest, user: dict = Depends(get_current_
 
     attachment_dicts = [a.model_dump() for a in body.attachments] if body.attachments else None
 
-    # Save user message — one dedicated record
-    user_msg = await db.save_message(
-        conversation_id=body.conversation_id,
-        role="user",
-        content=body.content,
-        attachments=attachment_dicts,
-        model=body.model,
-    )
-
-    start_ts = time.monotonic()
-
     async def event_generator():
         full_text = ""
         usage: dict = {}
         tools_used: list = []
         effective_model: str = body.model or ""
         error_message: str | None = None
+        user_message_id: str | None = None
         assistant_msg_id: str | None = None
+        latency_ms: int = 0
 
         try:
             async for chunk in claude.stream_chat(
@@ -59,6 +49,9 @@ async def stream_chat(body: StreamChatRequest, user: dict = Depends(get_current_
                             usage = payload.get("usage", {})
                             tools_used = payload.get("tools_used", [])
                             effective_model = payload.get("model", body.model or "")
+                            user_message_id = payload.get("user_message_id")
+                            assistant_msg_id = payload.get("assistant_message_id")
+                            latency_ms = payload.get("latency_ms", 0)
                     except Exception:
                         pass
                 yield chunk
@@ -67,26 +60,11 @@ async def stream_chat(body: StreamChatRequest, user: dict = Depends(get_current_
             error_message = str(exc)
             yield f"data: {json.dumps({'type': 'error', 'message': error_message})}\n\n"
 
-        latency_ms = int((time.monotonic() - start_ts) * 1000)
-
-        # Save assistant message — one dedicated record with full metadata
-        if full_text:
-            asst_msg = await db.save_message(
-                conversation_id=body.conversation_id,
-                role="assistant",
-                content=full_text,
-                model=effective_model,
-                tokens=usage or None,
-                latency_ms=latency_ms,
-                tools_used=tools_used or None,
-            )
-            assistant_msg_id = asst_msg["id"]
-
-            # Generate and update title on first message
-            if is_first_message:
-                title = await claude.generate_title(body.content)
-                await db.update_conversation(body.conversation_id, {"title": title})
-                yield f"data: {json.dumps({'type': 'title_update', 'title': title})}\n\n"
+        # Generate and update title on first message
+        if full_text and is_first_message:
+            title = await claude.generate_title(body.content)
+            await db.update_conversation(body.conversation_id, {"title": title})
+            yield f"data: {json.dumps({'type': 'title_update', 'title': title})}\n\n"
 
         # Write audit record (fire-and-forget — never blocks or crashes the stream)
         await db.save_audit_log({
@@ -94,7 +72,7 @@ async def stream_chat(body: StreamChatRequest, user: dict = Depends(get_current_
             "username": user.get("username", ""),
             "conversationId": body.conversation_id,
             "agentType": conversation.get("agentType", "claude"),
-            "userMessageId": user_msg["id"],
+            "userMessageId": user_message_id,
             "assistantMessageId": assistant_msg_id,
             "model": effective_model,
             "tokens": usage or None,
