@@ -1,8 +1,8 @@
 import os
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -15,11 +15,9 @@ DEMO_USERNAME = os.getenv("DEMO_USERNAME", "admin")
 DEMO_EMAIL = os.getenv("DEMO_EMAIL", "admin@nexchat.local")
 DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "nexchat123")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
 
-# Hashed demo password generated at startup
-_demo_password_hash = pwd_context.hash(DEMO_PASSWORD)
+_demo_password_hash = bcrypt.hashpw(DEMO_PASSWORD.encode("utf-8"), bcrypt.gensalt())
 
 DEMO_USERS = {
     DEMO_USERNAME: {
@@ -31,8 +29,10 @@ DEMO_USERS = {
 }
 
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+def verify_password(plain: str, hashed: bytes | str) -> bool:
+    if isinstance(hashed, str):
+        hashed = hashed.encode("utf-8")
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed)
 
 
 def authenticate_user(username: str, password: str) -> Optional[dict]:
